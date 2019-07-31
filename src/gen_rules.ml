@@ -86,7 +86,9 @@ module Gen(P : sig val sctx : Super_context.t end) = struct
       | Toplevel toplevel ->
         Toplevel_rules.setup ~sctx ~dir ~toplevel;
         For_stanza.empty_none
-      | Library lib ->
+      | Library lib when
+          Lib.DB.available (Scope.libs scope) (Dune_file.Library.best_name lib)
+        ->
         let cctx, merlin =
           Lib_rules.rules lib ~sctx ~dir ~scope ~dir_contents ~expander in
         { For_stanza.
