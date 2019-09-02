@@ -21,6 +21,46 @@ type exec_environment =
   ; stdin_from : Process.Io.input Process.Io.t
   }
 
+module Fiber_result = struct
+  type ('a, 'e) t = ('a, 'e) Result.t Fiber.t
+
+  let map ~f = Fiber.map ~f:(Result.map ~f)
+
+  let bind ~f =
+    Fiber.bind ~f:(function
+      | Error _ as error -> Fiber.return error
+      | Ok a -> f a)
+
+  let unit = Fiber.return (Result.Ok ())
+
+  let error e = Fiber.return (Result.Error e)
+
+  let return a = Fiber.return (Result.Ok a)
+
+  let wrap = Fiber.map ~f:(fun a -> Result.Ok a)
+
+  module O : sig
+    (* val ( >>= ) : ('a, 'e) t -> ('a -> ('b, 'e) t) -> ('b, 'e) t *)
+
+    val ( >>| ) : ('a, 'e) t -> ('a -> 'b) -> ('b, 'e) t
+
+    (* val ( let+ ) : ('a, 'e) t -> ('a -> 'b) -> ('b, 'e) t *)
+
+    val ( let* ) : ('a, 'e) t -> ('a -> ('b, 'e) t) -> ('b, 'e) t
+  end = struct
+    (* let ( >>= ) t f = bind t ~f *)
+
+    let ( >>| ) t f = map t ~f
+
+    (* let ( let+ ) = ( >>| ) *)
+
+    let ( let* ) t f = bind t ~f
+  end
+end
+
+type unit_or_more_deps =
+  (unit, Dep.t Dune_action.Protocol.Dependency.Map.t) Fiber_result.t
+
 let validate_context_and_prog context prog =
   match context with
   | None
@@ -83,13 +123,15 @@ let ensure_at_most_one_dynamic_run ~ectx action =
   in
   ignore (loop action)
 
-let exec_run ~ectx ~eenv prog args =
+let exec_run ~ectx ~eenv prog args : unit_or_more_deps =
   validate_context_and_prog ectx.context prog;
-  Process.run Strict ~dir:eenv.working_dir ~env:eenv.env
+  Fiber_result.wrap
+  @@ Process.run Strict ~dir:eenv.working_dir ~env:eenv.env
     ~stdout_to:eenv.stdout_to ~stderr_to:eenv.stderr_to
-    ~stdin_from:eenv.stdin_from ~purpose:ectx.purpose prog args
+      ~stdin_from:eenv.stdin_from ~purpose:ectx.purpose prog args
 
-let exec_run_dynamic_client ~ectx ~eenv prog args =
+let exec_run_dynamic_client ~ectx ~eenv prog args : unit_or_more_deps =
+  let open Fiber_result.O in
   validate_context_and_prog ectx.context prog;
   let open Dune_action in
   let to_dune_dep : Protocol.Dependency.t -> Dep.t =
@@ -114,10 +156,11 @@ let exec_run_dynamic_client ~ectx ~eenv prog args =
     in
     Env.add eenv.env ~var:Protocol.run_by_dune_env_variable ~value
   in
-  let+ () =
-    Process.run Strict ~dir:eenv.working_dir ~env ~stdout_to:eenv.stdout_to
+  let* () =
+    Fiber_result.wrap
+    @@ Process.run Strict ~dir:eenv.working_dir ~env ~stdout_to:eenv.stdout_to
       ~stderr_to:eenv.stderr_to ~stdin_from:eenv.stdin_from
-      ~purpose:ectx.purpose prog args
+        ~purpose:ectx.purpose prog args
   in
   let response = Io.String_path.read_file response_fn in
   Stdune.Path.(
@@ -151,21 +194,19 @@ let exec_run_dynamic_client ~ectx ~eenv prog args =
       ; Pp.text
         "Are you using different dune version to compile the executable?"
       ]
-  | Ok (Some Done) -> Done
+  | Ok (Some Done) -> Fiber_result.unit
   | Ok (Some (Need_more_deps deps)) ->
-    Need_more_deps
+    Fiber_result.error
       Protocol.Dependency.(
         deps |> Set.to_map |> Map.mapi ~f:(fun e () -> to_dune_dep e))
 
-let exec_echo stdout_to str =
-  Fiber.return (output_string (Process.Io.out_channel stdout_to) str)
+let exec_echo stdout_to str : unit_or_more_deps =
+  Fiber_result.return (output_string (Process.Io.out_channel stdout_to) str)
 
-let rec exec t ~ectx ~eenv =
+let rec exec t ~ectx ~eenv : unit_or_more_deps =
   match (t : Action.t) with
   | Run (Error e, _) -> Action.Prog.Not_found.raise e
-  | Run (Ok prog, args) ->
-    let+ () = exec_run ~ectx ~eenv prog args in
-    Done
+  | Run (Ok prog, args) -> exec_run ~ectx ~eenv prog args
   | Dynamic_run (Error e, _) -> Action.Prog.Not_found.raise e
   | Dynamic_run (Ok prog, args) ->
     exec_run_dynamic_client ~ectx ~eenv prog args
@@ -174,24 +215,22 @@ let rec exec t ~ectx ~eenv =
     exec t ~ectx ~eenv:{ eenv with env = Env.add eenv.env ~var ~value }
   | Redirect_out (Stdout, fn, Echo s) ->
     Io.write_file (Path.build fn) (String.concat s ~sep:" ");
-    Fiber.return Done
+    Fiber_result.unit
   | Redirect_out (outputs, fn, t) ->
     let fn = Path.build fn in
     redirect_out t ~ectx ~eenv outputs fn
   | Redirect_in (inputs, fn, t) -> redirect_in t ~ectx ~eenv inputs fn
   | Ignore (outputs, t) -> redirect_out t ~ectx ~eenv outputs Config.dev_null
   | Progn ts -> exec_list ts ~ectx ~eenv
-  | Echo strs ->
-    let+ () = exec_echo eenv.stdout_to (String.concat strs ~sep:" ") in
-    Done
+  | Echo strs -> exec_echo eenv.stdout_to (String.concat strs ~sep:" ")
   | Cat fn ->
     Io.with_file_in fn ~f:(fun ic ->
       Io.copy_channels ic (Process.Io.out_channel eenv.stdout_to));
-    Fiber.return Done
+    Fiber_result.unit
   | Copy (src, dst) ->
     let dst = Path.build dst in
     Io.copy_file ~src ~dst ();
-    Fiber.return Done
+    Fiber_result.unit
   | Symlink (src, dst) ->
     ( if Sys.win32 then
       let dst = Path.build dst in
@@ -214,7 +253,7 @@ let rec exec t ~ectx ~eenv =
           Unix.symlink src dst
         )
       | exception _ -> Unix.symlink src dst );
-    Fiber.return Done
+    Fiber_result.unit
   | Copy_and_add_line_directive (src, dst) ->
     Io.with_file_in src ~f:(fun ic ->
       Path.build dst
@@ -223,36 +262,32 @@ let rec exec t ~ectx ~eenv =
         output_string oc
           (Utils.line_directive ~filename:(Path.to_string fn) ~line_number:1);
         Io.copy_channels ic oc));
-    Fiber.return Done
+    Fiber_result.unit
   | System cmd ->
     let path, arg =
       Utils.system_shell_exn ~needed_to:"interpret (system ...) actions"
     in
-    let+ () = exec_run ~ectx ~eenv path [ arg; cmd ] in
-    Done
+    exec_run ~ectx ~eenv path [ arg; cmd ]
   | Bash cmd ->
-    let+ () =
-      exec_run ~ectx ~eenv
-        (Utils.bash_exn ~needed_to:"interpret (bash ...) actions")
-        [ "-e"; "-u"; "-o"; "pipefail"; "-c"; cmd ]
-    in
-    Done
+    exec_run ~ectx ~eenv
+      (Utils.bash_exn ~needed_to:"interpret (bash ...) actions")
+      [ "-e"; "-u"; "-o"; "pipefail"; "-c"; cmd ]
   | Write_file (fn, s) ->
     Io.write_file (Path.build fn) s;
-    Fiber.return Done
+    Fiber_result.unit
   | Rename (src, dst) ->
     Unix.rename (Path.Build.to_string src) (Path.Build.to_string dst);
-    Fiber.return Done
+    Fiber_result.unit
   | Remove_tree path ->
     Path.rm_rf (Path.build path);
-    Fiber.return Done
+    Fiber_result.unit
   | Mkdir path ->
     if Path.is_in_build_dir path then
       Path.mkdir_p path
     else
       Code_error.raise "Action_exec.exec: mkdir on non build dir"
         [ ("path", Path.to_dyn path) ];
-    Fiber.return Done
+    Fiber_result.unit
   | Digest_files paths ->
     let s =
       let data =
@@ -261,8 +296,7 @@ let rec exec t ~ectx ~eenv =
       in
       Digest.generic data
     in
-    let+ () = exec_echo eenv.stdout_to (Digest.to_string_raw s) in
-    Done
+    exec_echo eenv.stdout_to (Digest.to_string_raw s)
   | Diff ({ optional; file1; file2; mode } as diff) ->
     let remove_intermediate_file () =
       if optional then
@@ -270,14 +304,14 @@ let rec exec t ~ectx ~eenv =
     in
     if Diff.eq_files diff then (
       remove_intermediate_file ();
-      Fiber.return Done
+      Fiber_result.unit
     ) else
       let is_copied_from_source_tree file =
         match Path.extract_build_context_dir_maybe_sandboxed file with
         | None -> false
         | Some (_, file) -> Path.exists (Path.source file)
       in
-      let+ () =
+      let* () =
         Fiber.finalize
           (fun () ->
             if mode = Binary then
@@ -314,7 +348,7 @@ let rec exec t ~ectx ~eenv =
                 remove_intermediate_file () );
             Fiber.return ())
       in
-      Done
+      Fiber_result.unit
   | Merge_files_into (sources, extras, target) ->
     let lines =
       List.fold_left
@@ -326,9 +360,10 @@ let rec exec t ~ectx ~eenv =
     in
     let target = Path.build target in
     Io.write_lines target (String.Set.to_list lines);
-    Fiber.return Done
+    Fiber_result.unit
 
 and redirect_out t ~ectx ~eenv outputs fn =
+  let open Fiber_result.O in
   let out = Process.Io.file fn Process.Io.Out in
   let stdout_to, stderr_to =
     match outputs with
@@ -337,35 +372,31 @@ and redirect_out t ~ectx ~eenv outputs fn =
     | Outputs -> (out, out)
   in
   exec t ~ectx ~eenv:{ eenv with stdout_to; stderr_to }
-  >>| fun result ->
-  Process.Io.release out;
-  result
+  >>| fun () -> Process.Io.release out
 
 and redirect_in t ~ectx ~eenv inputs fn =
+  let open Fiber_result.O in
   let in_ = Process.Io.file fn Process.Io.In in
   let stdin_from =
     match inputs with
     | Stdin -> in_
   in
   exec t ~ectx ~eenv:{ eenv with stdin_from }
-  >>| fun result ->
-  Process.Io.release in_;
-  result
+  >>| fun () -> Process.Io.release in_
 
 and exec_list ts ~ectx ~eenv =
+  let open Fiber_result.O in
   match ts with
-  | [] -> Fiber.return Done
+  | [] -> Fiber_result.unit
   | [ t ] -> exec t ~ectx ~eenv
-  | t :: rest -> (
-    let* done_or_deps =
+  | t :: rest ->
+    let* () =
       let stdout_to = Process.Io.multi_use eenv.stdout_to in
       let stderr_to = Process.Io.multi_use eenv.stderr_to in
       let stdin_from = Process.Io.multi_use eenv.stdin_from in
       exec t ~ectx ~eenv:{ eenv with stdout_to; stderr_to; stdin_from }
     in
-    match done_or_deps with
-    | Need_more_deps _ as need -> Fiber.return need
-    | Done -> exec_list rest ~ectx ~eenv )
+    exec_list rest ~ectx ~eenv
 
 let exec ~targets ~context ~env ~rule_loc ~prepared_dependencies t =
   let purpose = Process.Build_job targets in
@@ -381,4 +412,7 @@ let exec ~targets ~context ~env ~rule_loc ~prepared_dependencies t =
   (* TODO jstaron: Maybe it would be better if this check would be somewhere
     earlier in the processing of action? (Like parsing instead of execution) *)
   ensure_at_most_one_dynamic_run ~ectx t;
-  exec t ~ectx ~eenv
+  let+ result = exec t ~ectx ~eenv in
+  match result with
+  | Ok () -> Done
+  | Error deps -> Need_more_deps deps
