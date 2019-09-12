@@ -1,6 +1,5 @@
 {
 open! Stdune
-module Re = Dune_re
 open Re
 
 let no_slash        = diff any (char '/')
@@ -65,4 +64,3 @@ and char_set st = parse
     | exception Failure msg ->
       Error (Lexing.lexeme_start lb, msg)
 }
-

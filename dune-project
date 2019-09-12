@@ -65,5 +65,5 @@ executable was built.
  (name dune-action-plugin)
  (depends
   (ocaml (>= 4.02)))
- (synopsis "Dune action plugin. Do use!")
+ (synopsis "Applicative and monadic interface for declaring dependencies.")
  (description ""))

@@ -1,6 +1,7 @@
 open! Stdune
 include Stdune
-module Re = Dune_re
+open! Dune_re
+include Dune_re
 
 (* To make bug reports usable *)
 let () = Printexc.record_backtrace true

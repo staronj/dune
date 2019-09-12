@@ -2,7 +2,7 @@ open! Stdune
 open Import
 
 type t =
-  { re : Dune_re.re
+  { re : Re.re
   ; repr : string
   }
 

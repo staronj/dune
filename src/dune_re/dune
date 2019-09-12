@@ -1,0 +1,8 @@
+(library
+ (name     dune_re)
+ (public_name dune-private-libs.dune_re)
+ (flags    (:standard -w -50))
+ (synopsis "Internal Dune library, do not use!")
+ (libraries dune-private-libs.stdune dune-private-libs.vendor_re dune-private-libs.result))
+
+ (ocamllex glob_lexer)
